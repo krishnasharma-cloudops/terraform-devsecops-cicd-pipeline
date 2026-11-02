@@ -1,0 +1,98 @@
+# IMPORTANT: This blueprint requires a PRE-CREATED Azure Blob backend + RBAC.
+# NEVER run Apply with ephemeral local state in distinct pipeline jobs.
+# Replace your service connection and define the following pipeline vars:
+# TF_VAR_subscription_id, TF_BACKEND_RG, TF_BACKEND_STORAGE, TF_BACKEND_CONTAINER, TF_BACKEND_KEY
+# Backend access must allow Storage Blob Data Contributor for the pipeline's identity.
+trigger:
+  branches:
+    include:
+      - main
+pr: none # No Azure credential-bearing jobs on untrusted pull requests. Use GitHub quality CI for PR validation.
+stages:
+  - stage: Plan
+    jobs:
+      - job: Plan
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: Terraform plan with persistent Azure Blob state
+            inputs:
+              azureSubscription: 'YOUR-AZURE-SERVICE-CONNECTION'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                curl -fsSL -o /tmp/terraform.zip https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_amd64.zip
+                unzip -o /tmp/terraform.zip -d /tmp
+                sudo mv /tmp/terraform /usr/local/bin/terraform
+                cd infra
+                terraform fmt -recursive
+                terraform init -input=false \
+                  -backend-config="resource_group_name=$TF_BACKEND_RG" \
+                  -backend-config="storage_account_name=$TF_BACKEND_STORAGE" \
+                  -backend-config="container_name=$TF_BACKEND_CONTAINER" \
+                  -backend-config="key=$TF_BACKEND_KEY" \
+                  -backend-config="use_cli=true" \
+                  -backend-config="use_azuread_auth=true"
+                terraform validate
+                terraform plan -input=false -out=tfplan
+            env:
+              TF_VAR_subscription_id: $(TF_VAR_subscription_id)
+              TF_BACKEND_RG: $(TF_BACKEND_RG)
+              TF_BACKEND_STORAGE: $(TF_BACKEND_STORAGE)
+              TF_BACKEND_CONTAINER: $(TF_BACKEND_CONTAINER)
+              TF_BACKEND_KEY: $(TF_BACKEND_KEY)
+          # NOTE: Terraform plan files can contain secrets. Limit artifact access!
+          - publish: infra/tfplan
+            artifact: terraform-plan
+            displayName: Publish restricted plan artifact
+  - stage: Apply
+    displayName: Apply only after human approval on main
+    dependsOn: Plan
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: Approval
+        pool: server
+        timeoutInMinutes: 1440
+        steps:
+          - task: ManualValidation@1
+            timeoutInMinutes: 120
+            inputs:
+              instructions: 'Inspect Terraform plan, state backend, cost and scope before approving.'
+              onTimeout: reject
+      - job: Apply
+        dependsOn: Approval
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          - download: current
+            artifact: terraform-plan
+          - task: AzureCLI@2
+            displayName: Apply approved plan against persistent state
+            inputs:
+              azureSubscription: 'YOUR-AZURE-SERVICE-CONNECTION'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                curl -fsSL -o /tmp/terraform.zip https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_amd64.zip
+                unzip -o /tmp/terraform.zip -d /tmp
+                sudo mv /tmp/terraform /usr/local/bin/terraform
+                cd infra
+                terraform init -input=false \
+                  -backend-config="resource_group_name=$TF_BACKEND_RG" \
+                  -backend-config="storage_account_name=$TF_BACKEND_STORAGE" \
+                  -backend-config="container_name=$TF_BACKEND_CONTAINER" \
+                  -backend-config="key=$TF_BACKEND_KEY" \
+                  -backend-config="use_cli=true" \
+                  -backend-config="use_azuread_auth=true"
+                terraform apply -input=false "$(Pipeline.Workspace)/terraform-plan/tfplan"
+            env:
+              TF_VAR_subscription_id: $(TF_VAR_subscription_id)
+              TF_BACKEND_RG: $(TF_BACKEND_RG)
+              TF_BACKEND_STORAGE: $(TF_BACKEND_STORAGE)
+              TF_BACKEND_CONTAINER: $(TF_BACKEND_CONTAINER)
+              TF_BACKEND_KEY: $(TF_BACKEND_KEY)
